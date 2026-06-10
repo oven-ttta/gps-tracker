@@ -2,6 +2,9 @@ import React, { useState, useEffect, useRef } from 'react';
 import { MapContainer, TileLayer, Marker, Popup, Circle, useMap } from 'react-leaflet';
 import { Bell, MapPin, Navigation, Settings, AlertTriangle, ShieldAlert, Crosshair, Mail, User } from 'lucide-react';
 import L from 'leaflet';
+import mqtt from 'mqtt';
+import { registerPlugin } from '@capacitor/core';
+const BackgroundGeolocation = registerPlugin('BackgroundGeolocation');
 
 // Create custom icons
 const createIcon = (type) => {
@@ -48,10 +51,7 @@ function App() {
 
   // Map & Devices State
   const [myLocation, setMyLocation] = useState(null);
-  const [devices, setDevices] = useState([
-    { id: 'd1', name: "Wife's Car", lat: 13.7563, lng: 100.5018, status: 'safe' },
-    { id: 'd2', name: "Child's Phone", lat: 13.7500, lng: 100.4900, status: 'safe' }
-  ]);
+  const [devices, setDevices] = useState([]);
   const [geofence, setGeofence] = useState({ lat: 13.7563, lng: 100.5018, radius: 2000 }); // 2km radius
   const [notifications, setNotifications] = useState([
     { id: 1, type: 'info', title: 'System Started', desc: 'GPS Tracking system initialized.', time: new Date().toLocaleTimeString(), extraClass: '' }
@@ -59,8 +59,14 @@ function App() {
   const [selectedDevice, setSelectedDevice] = useState('all');
   const [mapCenter, setMapCenter] = useState([13.7563, 100.5018]);
   
-  // Simulation interval ref
-  const simRef = useRef(null);
+  // Real-time & Background Refs
+  const mqttClient = useRef(null);
+  const myDeviceId = useRef(localStorage.getItem('deviceId') || ('d_' + Math.random().toString(36).substr(2, 9)));
+  const geofenceSet = useRef(false);
+
+  useEffect(() => {
+    localStorage.setItem('deviceId', myDeviceId.current);
+  }, []);
 
   const handleLogin = (e) => {
     e.preventDefault();
@@ -70,19 +76,46 @@ function App() {
     }
   };
 
-  // Initialize My Location
+  // Connect to MQTT for Real-time Device Sync
   useEffect(() => {
-    if (isLoggedIn && navigator.geolocation) {
-      navigator.geolocation.getCurrentPosition(
-        (pos) => {
-          const { latitude, longitude } = pos.coords;
-          setMyLocation([latitude, longitude]);
-          setMapCenter([latitude, longitude]);
-          setGeofence(prev => ({ ...prev, lat: latitude, lng: longitude }));
-        },
-        (err) => console.error(err)
-      );
-    }
+    if (!isLoggedIn) return;
+    
+    // Connect to public MQTT Broker over WebSockets
+    const client = mqtt.connect('wss://test.mosquitto.org:8081');
+    mqttClient.current = client;
+
+    client.on('connect', () => {
+      client.subscribe('gpstracker/ttta/locations');
+      addNotification('success', 'Online', 'Connected to real-time network. Other devices will appear here.');
+    });
+
+    client.on('message', (topic, message) => {
+      if (topic === 'gpstracker/ttta/locations') {
+        try {
+          const data = JSON.parse(message.toString());
+          if (data.id === myDeviceId.current) return; // Skip our own messages
+          
+          setDevices(prev => {
+            const exists = prev.find(d => d.id === data.id);
+            
+            // Check if device just went outside geofence
+            if (exists && exists.status === 'safe' && data.status === 'alert') {
+              addNotification('danger', 'Geofence Alert', `${data.name} has left their designated safe zone!`);
+              sendEmailAlert(data.name);
+            } else if (exists && exists.status === 'alert' && data.status === 'safe') {
+              addNotification('success', 'Back to Safety', `${data.name} has re-entered the safe zone.`);
+            }
+
+            if (exists) {
+              return prev.map(d => d.id === data.id ? { ...d, lat: data.lat, lng: data.lng, status: data.status, name: data.name } : d);
+            }
+            return [...prev, { id: data.id, name: data.name, lat: data.lat, lng: data.lng, status: data.status }];
+          });
+        } catch(e) {}
+      }
+    });
+
+    return () => client.end();
   }, [isLoggedIn]);
 
   // Distance calculator
@@ -117,36 +150,74 @@ function App() {
     }, 1500);
   };
 
-  // Simulate movement
+  // Track Location (Foreground & Background)
   useEffect(() => {
     if (!isLoggedIn) return;
 
-    simRef.current = setInterval(() => {
-      setDevices(prev => prev.map(dev => {
-        // Random slight movement
-        const newLat = dev.lat + (Math.random() - 0.5) * 0.002;
-        const newLng = dev.lng + (Math.random() - 0.5) * 0.002;
-        
-        // Check Geofence
-        const dist = getDistance(geofence.lat, geofence.lng, newLat, newLng);
-        const isOutside = dist > geofence.radius;
-        
-        let newStatus = isOutside ? 'alert' : 'safe';
-        
-        // Trigger notification on status change
-        if (dev.status === 'safe' && newStatus === 'alert') {
-          addNotification('danger', 'Geofence Alert', `${dev.name} has left the designated safe zone!`);
-          sendEmailAlert(dev.name); // Trigger email notification
-        } else if (dev.status === 'alert' && newStatus === 'safe') {
-          addNotification('success', 'Back to Safety', `${dev.name} has re-entered the safe zone.`);
+    let bgWatcherId = null;
+
+    const updateLocation = (lat, lng) => {
+      setMyLocation([lat, lng]);
+      
+      // Initialize geofence center to our first location
+      setGeofence(prev => {
+        if (!geofenceSet.current) {
+          geofenceSet.current = true;
+          setMapCenter([lat, lng]);
+          return { ...prev, lat, lng };
         }
+        return prev;
+      });
 
-        return { ...dev, lat: newLat, lng: newLng, status: newStatus };
-      }));
-    }, 3000);
+      // Calculate status against current geofence
+      const dist = getDistance(geofence.lat, geofence.lng, lat, lng);
+      const status = dist > geofence.radius ? 'alert' : 'safe';
 
-    return () => clearInterval(simRef.current);
-  }, [geofence, isLoggedIn, userEmail]);
+      // Publish to other devices
+      if (mqttClient.current && mqttClient.current.connected) {
+        mqttClient.current.publish('gpstracker/ttta/locations', JSON.stringify({
+          id: myDeviceId.current,
+          name: userEmail.split('@')[0],
+          lat, lng, status
+        }));
+      }
+    };
+
+    // 1. Standard HTML5 Geolocation (Works in Browser while open)
+    const fgWatchId = navigator.geolocation.watchPosition(
+      (pos) => updateLocation(pos.coords.latitude, pos.coords.longitude),
+      (err) => console.error('Foreground GPS Error:', err),
+      { enableHighAccuracy: true, maximumAge: 10000, timeout: 5000 }
+    );
+
+    // 2. Capacitor Background Geolocation (Works in Native APK even when closed)
+    try {
+      BackgroundGeolocation.addWatcher(
+        {
+          backgroundMessage: "Tracking your location in background.",
+          backgroundTitle: "GPS Tracker Hub",
+          requestPermissions: true,
+          stale: false,
+          distanceFilter: 10 // Update every 10 meters
+        },
+        (location, error) => {
+          if (error) return console.error('Background GPS Error:', error);
+          if (location) updateLocation(location.latitude, location.longitude);
+        }
+      ).then(id => {
+        bgWatcherId = id;
+      });
+    } catch (e) {
+      console.log('Background geolocation plugin is only active on Native Android/iOS builds.');
+    }
+
+    return () => {
+      navigator.geolocation.clearWatch(fgWatchId);
+      if (bgWatcherId) {
+        try { BackgroundGeolocation.removeWatcher({ id: bgWatcherId }); } catch(e) {}
+      }
+    };
+  }, [isLoggedIn, geofence]);
 
   const handleDeviceFocus = (id) => {
     setSelectedDevice(id);
